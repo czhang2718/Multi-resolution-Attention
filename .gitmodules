@@ -1,3 +1,3 @@
 [submodule "external/nanogpt"]
 	path = external/nanogpt
-	url = https://github.com/karpathy/nanoGPT
+	url = https://github.com/czhang2718/nanoGPT
