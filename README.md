@@ -7,3 +7,4 @@ To prepare shakespear char (very small), run
 
 To download openwebtext (13GB), run
 `python nanogpt/data/openwebtext/prepare.py`.
+This requires `pip install datasets==3.6.0` (see https://github.com/huggingface/datasets/issues/7693#issuecomment-3103380232)
