@@ -50,6 +50,7 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
+        # print("normal attn")
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -82,9 +83,10 @@ class CausalSelfAttention(nn.Module):
 class CausalSelfAttentionMerged(CausalSelfAttention):
 
     def __init__(self, config):
-        super().__init__()
+        super().__init__(config)
         
     def forward(self, x):
+        # print("merged attn")
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -93,32 +95,61 @@ class CausalSelfAttentionMerged(CausalSelfAttention):
         k = k.view(B, T, self.n_head, C // self.n_head)
         q = q.view(B, T, self.n_head, C // self.n_head)
         v = v.view(B, T, self.n_head, C // self.n_head)
-        # Merge consecutive pairs (2i, 2i+1) by averaging, then replicate back
+        
+        # Merge consecutive pairs (2i, 2i+1) by averaging - keep merged for attention
         # Process pairs for first T//2*2 vectors, keep remainder unchanged if T is odd
         T_pairs = T // 2 * 2
-        k_pairs = k[:, :T_pairs].view(B, T_pairs//2, 2, self.n_head, C // self.n_head).mean(dim=2).repeat_interleave(2, dim=1)
-        q_pairs = q[:, :T_pairs].view(B, T_pairs//2, 2, self.n_head, C // self.n_head).mean(dim=2).repeat_interleave(2, dim=1)
-        v_pairs = v[:, :T_pairs].view(B, T_pairs//2, 2, self.n_head, C // self.n_head).mean(dim=2).repeat_interleave(2, dim=1)
-        k = torch.cat([k_pairs, k[:, T_pairs:]], dim=1)
-        q = torch.cat([q_pairs, q[:, T_pairs:]], dim=1)
-        v = torch.cat([v_pairs, v[:, T_pairs:]], dim=1)
-        # Transpose to (B, nh, T, hs)
-        k = k.transpose(1, 2) # (B, nh, T, hs)
-        q = q.transpose(1, 2) # (B, nh, T, hs)
-        v = v.transpose(1, 2) # (B, nh, T, hs)
+        T_merged = T_pairs // 2
+        
+        # Merge pairs: (B, T_pairs, nh, hs) -> (B, T_merged, nh, hs)
+        k_merged = k[:, :T_pairs].view(B, T_merged, 2, self.n_head, C // self.n_head).mean(dim=2)
+        q_merged = q[:, :T_pairs].view(B, T_merged, 2, self.n_head, C // self.n_head).mean(dim=2)
+        v_merged = v[:, :T_pairs].view(B, T_merged, 2, self.n_head, C // self.n_head).mean(dim=2)
+        
+        # Handle remainder tokens if T is odd
+        has_remainder = T_pairs < T
+        if has_remainder:
+            k_full = torch.cat([k_merged, k[:, T_pairs:]], dim=1)
+            q_full = torch.cat([q_merged, q[:, T_pairs:]], dim=1)
+            v_full = torch.cat([v_merged, v[:, T_pairs:]], dim=1)
+            T_attn = T_merged + (T - T_pairs)
+        else:
+            k_full = k_merged
+            q_full = q_merged
+            v_full = v_merged
+            T_attn = T_merged
+        
+        # Transpose to (B, nh, T_attn, hs)
+        k_full = k_full.transpose(1, 2) # (B, nh, T_attn, hs)
+        q_full = q_full.transpose(1, 2) # (B, nh, T_attn, hs)
+        v_full = v_full.transpose(1, 2) # (B, nh, T_attn, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # causal self-attention with merged tokens; Self-attend: (B, nh, T_attn, hs) x (B, nh, hs, T_attn) -> (B, nh, T_attn, T_attn)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y_merged = torch.nn.functional.scaled_dot_product_attention(q_full, k_full, v_full, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = (q_full @ k_full.transpose(-2, -1)) * (1.0 / math.sqrt(k_full.size(-1)))
+            # Adjust bias mask for merged sequence length
+            att = att.masked_fill(self.bias[:,:,:T_attn,:T_attn] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            y_merged = att @ v_full # (B, nh, T_attn, T_attn) x (B, nh, T_attn, hs) -> (B, nh, T_attn, hs)
+        
+        # Transpose back to (B, T_attn, nh, hs)
+        y_merged = y_merged.transpose(1, 2) # (B, T_attn, nh, hs)
+        
+        # Expand merged tokens back to original pairs
+        y_pairs = y_merged[:, :T_merged].repeat_interleave(2, dim=1) # (B, T_pairs, nh, hs)
+        
+        # Concatenate with remainder if any
+        if has_remainder:
+            y = torch.cat([y_pairs, y_merged[:, T_merged:]], dim=1) # (B, T, nh, hs)
+        else:
+            y = y_pairs # (B, T, nh, hs)
+        
+        y = y.contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))

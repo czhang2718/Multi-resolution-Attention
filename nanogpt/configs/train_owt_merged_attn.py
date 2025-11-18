@@ -1,8 +1,8 @@
 # train a miniature character-level shakespeare model
 # good for debugging and playing on macbooks and such
 
-out_dir = 'out-shakespeare-char-merged-attn'
-eval_interval = 250 # keep frequent because we'll overfit
+out_dir = 'out-owt-merged-attn'
+eval_interval = 100 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
 
@@ -10,18 +10,18 @@ log_interval = 10 # don't print too too often
 always_save_checkpoint = False
 
 wandb_log = True # override via command line if you like
-wandb_project = 'shakespeare-char'
-wandb_run_name = 'mini-gpt-merged-attn'
+wandb_project = 'mult-resolution-attention'
+wandb_run_name = 'mini-gpt-merged-attn-owt'
 
-dataset = 'shakespeare_char'
+dataset = 'openwebtext'
 gradient_accumulation_steps = 1
-batch_size = 64
+batch_size = 256
 block_size = 256 # context of up to 256 previous characters
 merged_attn = True
 
 # baby GPT model :)
 n_layer = 12
-n_head = 6
+n_head = 1
 n_embd = 384
 dropout = 0.2
 
