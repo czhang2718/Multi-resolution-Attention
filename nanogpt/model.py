@@ -96,58 +96,146 @@ class CausalSelfAttentionMerged(CausalSelfAttention):
         q = q.view(B, T, self.n_head, C // self.n_head)
         v = v.view(B, T, self.n_head, C // self.n_head)
         
-        # Merge consecutive pairs (2i, 2i+1) by averaging - keep merged for attention
-        # Process pairs for first T//2*2 vectors, keep remainder unchanged if T is odd
-        T_pairs = T // 2 * 2
-        T_merged = T_pairs // 2
+        # Create two sets of overlapping merged pairs to avoid information leak:
+        # Even pairs: (0,1), (2,3), (4,5), ... -> merged at positions 0, 2, 4, ...
+        # Odd pairs: (1,2), (3,4), (5,6), ... -> merged at positions 1, 3, 5, ...
+        # For token j, use attention output from merge(j-1, j)
         
-        # Merge pairs: (B, T_pairs, nh, hs) -> (B, T_merged, nh, hs)
-        k_merged = k[:, :T_pairs].view(B, T_merged, 2, self.n_head, C // self.n_head).mean(dim=2)
-        q_merged = q[:, :T_pairs].view(B, T_merged, 2, self.n_head, C // self.n_head).mean(dim=2)
-        v_merged = v[:, :T_pairs].view(B, T_merged, 2, self.n_head, C // self.n_head).mean(dim=2)
-        
-        # Handle remainder tokens if T is odd
-        has_remainder = T_pairs < T
-        if has_remainder:
-            k_full = torch.cat([k_merged, k[:, T_pairs:]], dim=1)
-            q_full = torch.cat([q_merged, q[:, T_pairs:]], dim=1)
-            v_full = torch.cat([v_merged, v[:, T_pairs:]], dim=1)
-            T_attn = T_merged + (T - T_pairs)
+        # Even pairs: merge (2i, 2i+1) for i=0,1,2,...
+        T_even_pairs = (T - 1) // 2 * 2 + 1 if T > 0 else 0  # Last even index that can form a pair
+        # Ensure T_even_pairs is even for proper reshaping into pairs
+        T_even_pairs = (T_even_pairs // 2) * 2
+        if T_even_pairs >= 2:
+            num_even_merges = T_even_pairs // 2
+            k_even = k[:, :T_even_pairs].view(B, num_even_merges, 2, self.n_head, C // self.n_head).mean(dim=2)  # (B, num_even_merges, nh, hs)
+            q_even = q[:, :T_even_pairs].view(B, num_even_merges, 2, self.n_head, C // self.n_head).mean(dim=2)
+            v_even = v[:, :T_even_pairs].view(B, num_even_merges, 2, self.n_head, C // self.n_head).mean(dim=2)
         else:
-            k_full = k_merged
-            q_full = q_merged
-            v_full = v_merged
-            T_attn = T_merged
+            k_even = torch.empty(B, 0, self.n_head, C // self.n_head, device=k.device, dtype=k.dtype)
+            q_even = torch.empty(B, 0, self.n_head, C // self.n_head, device=q.device, dtype=q.dtype)
+            v_even = torch.empty(B, 0, self.n_head, C // self.n_head, device=v.device, dtype=v.dtype)
+            num_even_merges = 0
         
-        # Transpose to (B, nh, T_attn, hs)
-        k_full = k_full.transpose(1, 2) # (B, nh, T_attn, hs)
-        q_full = q_full.transpose(1, 2) # (B, nh, T_attn, hs)
-        v_full = v_full.transpose(1, 2) # (B, nh, T_attn, hs)
-
-        # causal self-attention with merged tokens; Self-attend: (B, nh, T_attn, hs) x (B, nh, hs, T_attn) -> (B, nh, T_attn, T_attn)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y_merged = torch.nn.functional.scaled_dot_product_attention(q_full, k_full, v_full, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        # Odd pairs: merge (2i-1, 2i) for i=1,2,3,... (i.e., (1,2), (3,4), (5,6), ...)
+        T_odd_start = 1
+        T_odd_end = T if T % 2 == 0 else T - 1  # Last odd index that can form a pair
+        # Ensure we have an even number of elements for proper reshaping into pairs
+        T_odd_end = T_odd_start + ((T_odd_end - T_odd_start) // 2) * 2
+        if T_odd_end > T_odd_start:
+            num_odd_merges = (T_odd_end - T_odd_start) // 2
+            k_odd = k[:, T_odd_start:T_odd_end].view(B, num_odd_merges, 2, self.n_head, C // self.n_head).mean(dim=2)  # (B, num_odd_merges, nh, hs)
+            q_odd = q[:, T_odd_start:T_odd_end].view(B, num_odd_merges, 2, self.n_head, C // self.n_head).mean(dim=2)
+            v_odd = v[:, T_odd_start:T_odd_end].view(B, num_odd_merges, 2, self.n_head, C // self.n_head).mean(dim=2)
         else:
-            # manual implementation of attention
-            att = (q_full @ k_full.transpose(-2, -1)) * (1.0 / math.sqrt(k_full.size(-1)))
-            # Adjust bias mask for merged sequence length
-            att = att.masked_fill(self.bias[:,:,:T_attn,:T_attn] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y_merged = att @ v_full # (B, nh, T_attn, T_attn) x (B, nh, T_attn, hs) -> (B, nh, T_attn, hs)
+            k_odd = torch.empty(B, 0, self.n_head, C // self.n_head, device=k.device, dtype=k.dtype)
+            q_odd = torch.empty(B, 0, self.n_head, C // self.n_head, device=q.device, dtype=q.dtype)
+            v_odd = torch.empty(B, 0, self.n_head, C // self.n_head, device=v.device, dtype=v.dtype)
+            num_odd_merges = 0
         
-        # Transpose back to (B, T_attn, nh, hs)
-        y_merged = y_merged.transpose(1, 2) # (B, T_attn, nh, hs)
+        # Transpose to (B, nh, T_merged, hs) for attention
+        T_even_attn = num_even_merges
+        T_odd_attn = num_odd_merges
         
-        # Expand merged tokens back to original pairs
-        y_pairs = y_merged[:, :T_merged].repeat_interleave(2, dim=1) # (B, T_pairs, nh, hs)
+        y_even = None
+        y_odd = None
         
-        # Concatenate with remainder if any
-        if has_remainder:
-            y = torch.cat([y_pairs, y_merged[:, T_merged:]], dim=1) # (B, T, nh, hs)
+        # Attention on even pairs
+        if T_even_attn > 0:
+            k_even_t = k_even.transpose(1, 2)  # (B, nh, T_even_attn, hs)
+            q_even_t = q_even.transpose(1, 2)
+            v_even_t = v_even.transpose(1, 2)
+            
+            if self.flash:
+                y_even = torch.nn.functional.scaled_dot_product_attention(q_even_t, k_even_t, v_even_t, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            else:
+                att_even = (q_even_t @ k_even_t.transpose(-2, -1)) * (1.0 / math.sqrt(k_even_t.size(-1)))
+                att_even = att_even.masked_fill(self.bias[:,:,:T_even_attn,:T_even_attn] == 0, float('-inf'))
+                att_even = F.softmax(att_even, dim=-1)
+                att_even = self.attn_dropout(att_even)
+                y_even = att_even @ v_even_t
+            y_even = y_even.transpose(1, 2)  # (B, T_even_attn, nh, hs)
+        
+        # Attention on odd pairs
+        if T_odd_attn > 0:
+            k_odd_t = k_odd.transpose(1, 2)  # (B, nh, T_odd_attn, hs)
+            q_odd_t = q_odd.transpose(1, 2)
+            v_odd_t = v_odd.transpose(1, 2)
+            
+            if self.flash:
+                y_odd = torch.nn.functional.scaled_dot_product_attention(q_odd_t, k_odd_t, v_odd_t, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            else:
+                att_odd = (q_odd_t @ k_odd_t.transpose(-2, -1)) * (1.0 / math.sqrt(k_odd_t.size(-1)))
+                att_odd = att_odd.masked_fill(self.bias[:,:,:T_odd_attn,:T_odd_attn] == 0, float('-inf'))
+                att_odd = F.softmax(att_odd, dim=-1)
+                att_odd = self.attn_dropout(att_odd)
+                y_odd = att_odd @ v_odd_t
+            y_odd = y_odd.transpose(1, 2)  # (B, T_odd_attn, nh, hs)
+        
+        # Combine attention outputs: for token j, use attention from merge(j-1, j)
+        # Even pairs: merge(2i, 2i+1) -> merge i contains tokens 2i and 2i+1
+        # Odd pairs: merge(2i-1, 2i) -> merge i contains tokens 2i-1 and 2i (for i>=1, so tokens 1,2 then 3,4, etc.)
+        # For token j:
+        #   - If j is even: merge(j-1, j) is in odd-pair set at position (j-2)//2 (since odd pairs start at token 1)
+        #   - If j is odd: merge(j-1, j) is in even-pair set at position (j-1)//2
+        # Token 0: compute attention separately on token 0 only (no merge, no leakage)
+        # Determine output dtype from attention outputs (handles mixed precision autocast)
+        if y_even is not None:
+            output_dtype = y_even.dtype
+        elif y_odd is not None:
+            output_dtype = y_odd.dtype
         else:
-            y = y_pairs # (B, T, nh, hs)
+            output_dtype = q.dtype
+        y = torch.zeros(B, T, self.n_head, C // self.n_head, device=x.device, dtype=output_dtype)
+        
+        # Token 0: compute attention on token 0 alone (no merge to avoid leakage from token 1)
+        if T > 0:
+            q0 = q[:, 0:1].transpose(1, 2)  # (B, nh, 1, hs)
+            k0 = k[:, 0:1].transpose(1, 2)  # (B, nh, 1, hs)
+            v0 = v[:, 0:1].transpose(1, 2)  # (B, nh, 1, hs)
+            
+            if self.flash:
+                y0 = torch.nn.functional.scaled_dot_product_attention(q0, k0, v0, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            else:
+                att0 = (q0 @ k0.transpose(-2, -1)) * (1.0 / math.sqrt(k0.size(-1)))  # (B, nh, 1, 1)
+                att0 = att0.masked_fill(self.bias[:,:,:1,:1] == 0, float('-inf'))
+                att0 = F.softmax(att0, dim=-1)
+                att0 = self.attn_dropout(att0)
+                y0 = att0 @ v0  # (B, nh, 1, hs)
+            y0_reshaped = y0.transpose(1, 2).squeeze(1)  # (B, nh, hs)
+            y[:, 0] = y0_reshaped.to(dtype=y.dtype)  # Ensure dtype match
+        
+        # For tokens j >= 1: use merge(j-1, j) - this ensures no leakage as merge only includes tokens <= j
+        # Use vectorized operations instead of loop
+        if T > 1:
+            # Even tokens: j=2,4,6,... use odd merges
+            even_indices = torch.arange(2, T, 2, device=x.device)  # [2, 4, 6, ...]
+            if len(even_indices) > 0:
+                even_merge_indices = (even_indices - 2) // 2  # [0, 1, 2, ...]
+                valid_even_mask = (even_merge_indices >= 0) & (even_merge_indices < T_odd_attn)
+                if valid_even_mask.any():
+                    valid_even_idx = even_indices[valid_even_mask]
+                    valid_even_merge_idx = even_merge_indices[valid_even_mask]
+                    y[:, valid_even_idx] = y_odd[:, valid_even_merge_idx].to(dtype=y.dtype)  # Ensure dtype match
+                # Handle invalid even indices by copying from previous token
+                invalid_even_mask = ~valid_even_mask
+                if invalid_even_mask.any():
+                    invalid_even_idx = even_indices[invalid_even_mask]
+                    y[:, invalid_even_idx] = y[:, invalid_even_idx - 1]
+            
+            # Odd tokens: j=1,3,5,... use even merges
+            odd_indices = torch.arange(1, T, 2, device=x.device)  # [1, 3, 5, ...]
+            if len(odd_indices) > 0:
+                odd_merge_indices = (odd_indices - 1) // 2  # [0, 1, 2, ...]
+                valid_odd_mask = odd_merge_indices < T_even_attn
+                if valid_odd_mask.any():
+                    valid_odd_idx = odd_indices[valid_odd_mask]
+                    valid_odd_merge_idx = odd_merge_indices[valid_odd_mask]
+                    y[:, valid_odd_idx] = y_even[:, valid_odd_merge_idx].to(dtype=y.dtype)  # Ensure dtype match
+                # Handle invalid odd indices by copying from previous token
+                invalid_odd_mask = ~valid_odd_mask
+                if invalid_odd_mask.any():
+                    invalid_odd_idx = odd_indices[invalid_odd_mask]
+                    y[:, invalid_odd_idx] = y[:, invalid_odd_idx - 1]
         
         y = y.contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
@@ -155,6 +243,134 @@ class CausalSelfAttentionMerged(CausalSelfAttention):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+
+class CausalSelfAttentionShifted(CausalSelfAttention):
+
+    def __init__(self, config):
+        super().__init__(config)
+        
+    def forward(self, x):
+        # print("shifted attn")
+        B, T, C = x.size()
+        
+        # Store original input for residual connection
+        x_orig = x
+        
+        # calculate query, key, values for all heads in batch
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        # Reshape to (B, T, n_head, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head)
+        q = q.view(B, T, self.n_head, C // self.n_head)
+        v = v.view(B, T, self.n_head, C // self.n_head)
+        
+        # Merge pairs: (0,1), (2,3), (4,5), etc.
+        # Number of pairs we can form
+        num_pairs = T // 2
+        if num_pairs == 0:
+            # Not enough tokens to merge pairs, fall back to regular attention
+            if T == 1:
+                q_t = q[:, 0:1].transpose(1, 2)  # (B, nh, 1, hs)
+                k_t = k[:, 0:1].transpose(1, 2)
+                v_t = v[:, 0:1].transpose(1, 2)
+                
+                if self.flash:
+                    y = torch.nn.functional.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+                else:
+                    att = (q_t @ k_t.transpose(-2, -1)) * (1.0 / math.sqrt(k_t.size(-1)))
+                    att = att.masked_fill(self.bias[:,:,:1,:1] == 0, float('-inf'))
+                    att = F.softmax(att, dim=-1)
+                    att = self.attn_dropout(att)
+                    y = att @ v_t
+                y = y.transpose(1, 2).contiguous().view(B, T, C)
+                y = self.resid_dropout(self.c_proj(y))
+                return y + x_orig
+            else:
+                return x_orig
+        
+        # Extract pairs: tokens at indices (0,1), (2,3), (4,5), etc.
+        pair_start_idx = 0
+        pair_end_idx = pair_start_idx + num_pairs * 2
+        pairs_tokens = k[:, pair_start_idx:pair_end_idx]  # (B, num_pairs*2, nh, hs)
+        
+        # Reshape to merge pairs: (B, num_pairs, 2, nh, hs) -> (B, num_pairs, nh, hs)
+        k_merged = pairs_tokens.view(B, num_pairs, 2, self.n_head, C // self.n_head).mean(dim=2)
+        q_merged = q[:, pair_start_idx:pair_end_idx].view(B, num_pairs, 2, self.n_head, C // self.n_head).mean(dim=2)
+        v_merged = v[:, pair_start_idx:pair_end_idx].view(B, num_pairs, 2, self.n_head, C // self.n_head).mean(dim=2)
+        
+        # Transpose for attention: (B, nh, num_pairs, hs)
+        k_merged_t = k_merged.transpose(1, 2)
+        q_merged_t = q_merged.transpose(1, 2)
+        v_merged_t = v_merged.transpose(1, 2)
+        
+        # Do attention at 1/2 length (on merged tokens)
+        if self.flash:
+            y_merged = torch.nn.functional.scaled_dot_product_attention(q_merged_t, k_merged_t, v_merged_t, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            att_merged = (q_merged_t @ k_merged_t.transpose(-2, -1)) * (1.0 / math.sqrt(k_merged_t.size(-1)))
+            att_merged = att_merged.masked_fill(self.bias[:,:,:num_pairs,:num_pairs] == 0, float('-inf'))
+            att_merged = F.softmax(att_merged, dim=-1)
+            att_merged = self.attn_dropout(att_merged)
+            y_merged = att_merged @ v_merged_t
+        
+        # Transpose back: (B, num_pairs, nh, hs)
+        y_merged = y_merged.transpose(1, 2)
+        
+        # Shift forward by 1 token position: merged pair (0,1) output -> positions (1,2), merged pair (2,3) -> (3,4), etc.
+        # Expand back 1->2 vectors: each merged token becomes 2 tokens
+        y_expanded = y_merged.unsqueeze(2).expand(B, num_pairs, 2, self.n_head, C // self.n_head)  # (B, num_pairs, 2, nh, hs)
+        y_expanded = y_expanded.contiguous().view(B, num_pairs * 2, self.n_head, C // self.n_head)  # (B, num_pairs*2, nh, hs)
+        
+        # Create output tensor and place expanded outputs at shifted positions (1,2), (3,4), (5,6), ...
+        y = torch.zeros(B, T, self.n_head, C // self.n_head, device=x.device, dtype=y_merged.dtype)
+        
+        # Handle token 0 separately (no merged pair updates it)
+        if T > 0:
+            q0 = q[:, 0:1].transpose(1, 2)  # (B, nh, 1, hs)
+            k0 = k[:, 0:1].transpose(1, 2)
+            v0 = v[:, 0:1].transpose(1, 2)
+            
+            if self.flash:
+                y0 = torch.nn.functional.scaled_dot_product_attention(q0, k0, v0, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            else:
+                att0 = (q0 @ k0.transpose(-2, -1)) * (1.0 / math.sqrt(k0.size(-1)))
+                att0 = att0.masked_fill(self.bias[:,:,:1,:1] == 0, float('-inf'))
+                att0 = F.softmax(att0, dim=-1)
+                att0 = self.attn_dropout(att0)
+                y0 = att0 @ v0
+            y[:, 0] = y0.transpose(1, 2).squeeze(1)
+        
+        # Place expanded outputs at shifted positions: merged pair (0,1) -> positions (1,2), merged pair (2,3) -> (3,4), etc.
+        output_start_idx = 1  # Start at position 1 (merged pair (0,1) updates positions 1,2)
+        output_end_idx = min(output_start_idx + num_pairs * 2, T)
+        if output_start_idx < T:
+            y[:, output_start_idx:output_end_idx] = y_expanded[:, :(output_end_idx - output_start_idx)]
+        
+        # Handle any remaining tokens that weren't part of pairs (e.g., if T is odd and last token wasn't paired)
+        if output_end_idx < T:
+            # Do regular attention on remaining tokens
+            q_remaining = q[:, output_end_idx:].transpose(1, 2)
+            k_remaining = k[:, output_end_idx:].transpose(1, 2)
+            v_remaining = v[:, output_end_idx:].transpose(1, 2)
+            
+            if self.flash:
+                y_remaining = torch.nn.functional.scaled_dot_product_attention(q_remaining, k_remaining, v_remaining, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            else:
+                T_remaining = T - output_end_idx
+                att_remaining = (q_remaining @ k_remaining.transpose(-2, -1)) * (1.0 / math.sqrt(k_remaining.size(-1)))
+                att_remaining = att_remaining.masked_fill(self.bias[:,:,:T_remaining,:T_remaining] == 0, float('-inf'))
+                att_remaining = F.softmax(att_remaining, dim=-1)
+                att_remaining = self.attn_dropout(att_remaining)
+                y_remaining = att_remaining @ v_remaining
+            y[:, output_end_idx:] = y_remaining.transpose(1, 2)
+        
+        # Re-assemble all head outputs side by side
+        y = y.contiguous().view(B, T, C)
+        
+        # Output projection
+        y = self.resid_dropout(self.c_proj(y))
+        
+        # Add to residual stream
+        return y + x_orig
 
 
 class MLP(nn.Module):
@@ -178,7 +394,12 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config) if not config.merged_attn else CausalSelfAttentionMerged(config)
+        attn_classes = {
+            'normal': CausalSelfAttention,
+            'merge': CausalSelfAttentionMerged,
+            'merge_shift': CausalSelfAttentionShifted,
+        }
+        self.attn = attn_classes[config.attn](config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -196,8 +417,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    merged_attn: bool = False
-    
+    attn: str = 'normal'
+
 class GPT(nn.Module):
 
     def __init__(self, config):

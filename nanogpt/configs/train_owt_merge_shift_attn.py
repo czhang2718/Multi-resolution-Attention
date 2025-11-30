@@ -1,7 +1,7 @@
 # train a miniature character-level shakespeare model
 # good for debugging and playing on macbooks and such
 
-out_dir = 'out-owt-baseline-1head'
+out_dir = 'out-owt-merge-shift-attn-1head'
 eval_interval = 50 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
@@ -11,13 +11,13 @@ always_save_checkpoint = False
 
 wandb_log = True # override via command line if you like
 wandb_project = 'mult-resolution-attention'
-wandb_run_name = 'mini-gpt-baseline-owt-1head'
+wandb_run_name = 'mini-gpt-merge-shift-attn-owt-1head'
 
 dataset = 'openwebtext'
 gradient_accumulation_steps = 1
 batch_size = 200
 block_size = 256 # context of up to 256 previous characters
-merged_attn = False
+attn = 'merge_shift'
 
 # baby GPT model :)
 n_layer = 12
