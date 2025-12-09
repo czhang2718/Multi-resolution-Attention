@@ -17,7 +17,7 @@ dataset = 'openwebtext'
 gradient_accumulation_steps = 1
 batch_size = 200
 block_size = 256 # context of up to 256 previous characters
-merged_attn = False
+attn = 'normal'
 
 # baby GPT model :)
 n_layer = 12

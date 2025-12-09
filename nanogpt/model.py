@@ -31,6 +31,7 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        self.config = config
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
@@ -50,7 +51,6 @@ class CausalSelfAttention(nn.Module):
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        # print("normal attn")
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -77,8 +77,6 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
-
-
 
 class CausalSelfAttentionMerged(CausalSelfAttention):
 
@@ -372,6 +370,291 @@ class CausalSelfAttentionShifted(CausalSelfAttention):
         # Add to residual stream
         return y + x_orig
 
+class CausalSelfAttentionMergedHierarchy(CausalSelfAttention):
+    """
+    Hierarchical attention with:
+      - Multi-level merged K/V (levels 0..kappa), where level i has blocks of size 2^i
+        built directly from the base sequence (no recursive dependency).
+      - Local window: for a query at position t, the last `local_window` tokens
+        are forced to use tier-0 (no merging that includes them).
+      - Alpha gating: for tokens outside that local window, coarser levels are only
+        allowed when they are far enough away, according to:
+
+            d = window_start(t) - block_end
+            level i allowed  <=>  d >= alpha ** i   (for i > 0)
+
+        where window_start(t) = max(0, t + 1 - local_window).
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.kappa = getattr(config, "kappa", 3)
+        self.alpha = float(getattr(config, "alpha", 2.0))
+        self.local_window = getattr(config, "local_window", 128)
+
+        print(f"Using Hierarchical Merged Attention: kappa={self.kappa}, alpha={self.alpha}, local_window={self.local_window}")
+
+    @staticmethod
+    def _build_hierarchy(k, v, kappa):
+        """
+        Build hierarchy levels directly from base K/V.
+
+        Inputs:
+          k, v : [B, T, H, D]  (level 0, one token per position)
+
+        For level i > 0:
+          - block size S = 2^i
+          - number of blocks T_i = T // S (only full blocks)
+          - j-th block spans [j*S, (j+1)*S - 1] in the original sequence.
+
+        Returns:
+          levels_k, levels_v : list of [B, T_i, H, D] per level (0..L-1)
+          starts_lvl, ends_lvl: list of [T_i] spans per level.
+        """
+        device = k.device
+        B, T, H, D = k.shape
+
+        base_k, base_v = k, v
+
+        levels_k = [base_k]
+        levels_v = [base_v]
+        starts_lvl = [torch.arange(T, device=device)]
+        ends_lvl   = [torch.arange(T, device=device)]
+
+        for i in range(1, kappa + 1):
+            block_size = 1 << i  # 2^i
+            n_blocks = T // block_size
+            if n_blocks == 0:
+                break
+
+            slice_len = n_blocks * block_size
+            # [B, slice_len, H, D] -> [B, n_blocks, block_size, H, D] -> mean over block
+            k_i = base_k[:, :slice_len].view(B, n_blocks, block_size, H, D).mean(dim=2)
+            v_i = base_v[:, :slice_len].view(B, n_blocks, block_size, H, D).mean(dim=2)
+
+            starts_i = torch.arange(n_blocks, device=device) * block_size
+            ends_i   = starts_i + (block_size - 1)
+
+            levels_k.append(k_i)
+            levels_v.append(v_i)
+            starts_lvl.append(starts_i)
+            ends_lvl.append(ends_i)
+
+        return levels_k, levels_v, starts_lvl, ends_lvl
+
+    def forward(self, x):
+        """
+        x : [B, T, C]
+        returns : [B, T, C]
+        """
+        B, T, C = x.size()
+        device = x.device
+        H = self.n_head
+        D = C // H
+
+        if T == 0:
+            return x
+
+        # --- Base Q,K,V ---
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q = q.view(B, T, H, D)
+        k = k.view(B, T, H, D)
+        v = v.view(B, T, H, D)
+
+        # --- Build hierarchy from base K,V ---
+        levels_k, levels_v, starts_lvl, ends_lvl = self._build_hierarchy(k, v, self.kappa)
+        level_lengths = [lk.size(1) for lk in levels_k]
+        num_levels = len(level_lengths)
+        L_total = sum(level_lengths)
+
+        # Flatten levels along the time axis
+        K_all = torch.cat(levels_k, dim=1)  # [B, L_total, H, D]
+        V_all = torch.cat(levels_v, dim=1)  # [B, L_total, H, D]
+
+        starts_global = torch.cat(starts_lvl, dim=0)  # [L_total]
+        ends_global   = torch.cat(ends_lvl, dim=0)    # [L_total]
+
+        # Level id per block: 0 for base tokens, 1 for first merged level, etc.
+        level_ids = torch.cat([
+            torch.full((L_len,), lvl, device=device, dtype=torch.long)
+            for lvl, L_len in enumerate(level_lengths)
+        ], dim=0)  # [L_total]
+
+        # --- Causal base mask: block can only be used once its end token exists ---
+        t_pos = torch.arange(T, device=device)   # [T]
+        t_mat = t_pos.unsqueeze(1)               # [T, 1]
+        ends_mat = ends_global.unsqueeze(0)      # [1, L_total]
+
+        causal_ok = ends_mat <= t_mat           # [T, L_total]
+
+        # --- Local window per query position ---
+        # For query at t, define window [w_start(t), t], where:
+        #   w_start(t) = max(0, t + 1 - local_window)
+        # These tokens are "local" and must use tier-0 only.
+        W = self.local_window
+        if W is None or W <= 0:
+            w_start = torch.zeros_like(t_pos)
+        else:
+            w_start = (t_pos + 1 - W).clamp(min=0)  # [T]
+        w_start_mat = w_start.unsqueeze(1)          # [T, 1]
+
+        # Blocks entirely before the local window for each t:
+        #   ends_global[b] < w_start(t)
+        pre_window = ends_mat < w_start_mat        # [T, L_total]
+
+        # Distance from window start to block end (only meaningful where pre_window is true):
+        #   d(t, b) = w_start(t) - ends_global[b]
+        d = (w_start_mat - ends_mat).clamp(min=1)  # [T, L_total], >=1 when pre_window
+
+        # --- Alpha gating: blocks at level i require d >= alpha^i ---
+        level_ids_f = level_ids.to(torch.float32)
+        alpha_pows = (torch.ones_like(level_ids_f) * self.alpha).pow(level_ids_f)  # [L_total]
+        alpha_pows_mat = alpha_pows.unsqueeze(0)                                   # [1, L_total]
+
+        is_level0    = (level_ids == 0).unsqueeze(0)  # [1, L_total]
+        is_level_ge1 = ~is_level0                     # [1, L_total]
+
+        # Level 0 is always allowed (subject to causality).
+        # For levels >=1: block must be entirely before the window AND far enough:
+        #   pre_window & (d >= alpha^level)
+        allowed_level = is_level0 | (pre_window & is_level_ge1 & (d >= alpha_pows_mat))
+
+        # Base allowed mask (causality + local/alpha gating)
+        use_ok = causal_ok & allowed_level          # [T, L_total], bool
+
+        # ============================================================
+        # OVERRIDING BEHAVIOR (no LxL matrices, hierarchical + linear)
+        # ============================================================
+
+        # 1. Split `use_ok` back into per-level slices.
+        level_offsets = []
+        offset = 0
+        for L_len in level_lengths:
+            level_offsets.append(offset)
+            offset += L_len
+
+        use_ok_levels = [
+            use_ok[:, level_offsets[i]: level_offsets[i] + level_lengths[i]].bool()
+            for i in range(num_levels)
+        ]
+
+        # 2. Process from coarsest level (highest index) down to finest (0).
+        #    `coverage` at level i means: this block is already covered by some
+        #    strictly higher-level block (i+1, i+2, ...).
+        final_levels = [None] * num_levels
+        coverage = torch.zeros_like(use_ok_levels[-1], dtype=torch.bool)  # for top level: no higher coverage
+
+        for li in range(num_levels - 1, -1, -1):
+            u = use_ok_levels[li]  # [T, n_i]
+
+            # Mask out any block already covered by higher levels.
+            u_final = u & ~coverage
+            final_levels[li] = u_final
+
+            if li > 0:
+                # Any block at this level that is either:
+                #  - used itself (u_final), OR
+                #  - covered by even higher levels (coverage),
+                # will "cover" its children at the next finer level.
+                parent_mask = (u_final | coverage)   # [T, n_parent]
+
+                n_parent = parent_mask.shape[1]
+                n_child  = use_ok_levels[li - 1].shape[1]
+
+                if n_child == 0 or n_parent == 0:
+                    coverage = torch.zeros((T, n_child), device=device, dtype=torch.bool)
+                else:
+                    # Each parent block corresponds to up to 2 child blocks, aligned at the front.
+                    # There may be extra child blocks at the tail that have no parent at this level.
+                    span = min(2 * n_parent, n_child)
+                    cov_child = torch.zeros((T, n_child), device=device, dtype=torch.bool)
+
+                    # Only need the parents that actually map into children.
+                    n_par_used = span // 2
+                    if n_par_used > 0:
+                        proj = parent_mask[:, :n_par_used].repeat_interleave(2, dim=1)  # [T, 2*n_par_used]
+                        cov_child[:, : 2 * n_par_used] = proj[:, : 2 * n_par_used]
+
+                    coverage = cov_child  # coverage mask for level (li-1)
+
+        # 3. Re-flatten to [T, L_total] with overriding applied.
+        use_ok = torch.cat(final_levels, dim=1)  # [T, L_total], bool
+
+
+        # # DEBUG
+        # if True:
+        #     # Intentionally make use_ok almost empty to test correctness
+        #     # Make use_ok only ever attend to the first token
+        #     use_ok = torch.zeros_like(use_ok, dtype=torch.bool)
+        #     use_ok[:, 0] = True
+
+        # --- Apply attention over flattened hierarchy ---
+        q_base  = q.transpose(1, 2)                 # [B, H, T, D]
+        K_all_t = K_all.transpose(1, 2)             # [B, H, L_total, D]
+        V_all_t = V_all.transpose(1, 2)             # [B, H, L_total, D]
+
+        mask_dtype = q_base.dtype
+        neg_inf = torch.finfo(mask_dtype).min
+        attn_mask = torch.zeros(T, L_total, device=device, dtype=mask_dtype)
+        attn_mask[~use_ok] = neg_inf               # 0 for allowed, -inf for masked
+
+        # =========================
+        # DEBUG: sparsity check
+        # =========================
+        # if self.training and not hasattr(self, "_debug_sparsity"):
+        # if True:
+        if False:
+            # Print the entire mask in compressed 0 1 form, extract one mask, and print all T by L_total
+            print("Final overridden mask (use_ok):")
+            for t in range(T):
+                row = use_ok[t].to(torch.int32).cpu().numpy()
+                row_str = ''.join(str(x) for x in row.tolist())
+                print(f"t={t:4d}: {row_str}")
+            # 1. Final overridden mask
+            final_true = use_ok.sum().item()
+            final_total = use_ok.numel()
+
+            # 2. Baseline "normal attention" over BASE TOKENS only (T x T causal)
+            baseline_causal = torch.tril(torch.ones(T, T, device=use_ok.device, dtype=torch.bool))
+            baseline_true = baseline_causal.sum().item()
+            baseline_total = baseline_causal.numel()
+
+            # 3. Baseline over FLATTENED BLOCKS (your old causal_ok, no override)
+            baseline_blocks_true = causal_ok.sum().item()
+            baseline_blocks_total = causal_ok.numel()
+
+            print("\n========== ATTENTION SPARSITY DEBUG ==========")
+            print(f"Final OVERRIDDEN mask: {final_true} / {final_total} = {final_true/final_total:.4f}")
+            print(f"Baseline TOKEN causal: {baseline_true} / {baseline_total} = {baseline_true/baseline_total:.4f}")
+            print(f"Baseline BLOCK causal: {baseline_blocks_true} / {baseline_blocks_total} = {baseline_blocks_true/baseline_blocks_total:.4f}")
+            print("=============================================\n")
+            self._debug_sparsity = True  # only once
+    
+        if self.flash and False:
+            # print a small submatrix of attn_mask
+            # print(f"HI! Attn mask shape: {attn_mask.shape}")
+            # print(f"Attn mask sample:\n{attn_mask[:8, :4]}")
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q_base, K_all_t, V_all_t,
+                attn_mask=attn_mask,               # [T, L_total], broadcast over B,H
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False                    # causality is encoded in attn_mask
+            )
+            # Print a small submatrix of y
+            # print(f"Y shape: {y.shape}")
+            # print(f"Y sample:\n{y[0, 0, :8, :4]}")
+        else:
+            att = (q_base @ K_all_t.transpose(-2, -1)) * (1.0 / math.sqrt(D))  # [B, H, T, L_total]
+            att = att + attn_mask.unsqueeze(0).unsqueeze(0)                    # add mask
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ V_all_t                                                  # [B, H, T, D]
+
+        # Back to [B, T, C]
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
 
 class MLP(nn.Module):
 
@@ -396,8 +679,9 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         attn_classes = {
             'normal': CausalSelfAttention,
-            'merge': CausalSelfAttentionMerged,
+            'merge2': CausalSelfAttentionMerged,
             'merge_shift': CausalSelfAttentionShifted,
+            'segtree': CausalSelfAttentionMergedHierarchy,
         }
         self.attn = attn_classes[config.attn](config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
@@ -419,6 +703,10 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     attn: str = 'normal'
 
+    local_window: int = 128   # number of most recent tokens kept at full resolution
+    alpha: float = 2.0        # base for log distance -> level mapping
+    kappa: int = 3            # maximum hierarchy level
+    
 class GPT(nn.Module):
 
     def __init__(self, config):
