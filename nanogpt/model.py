@@ -370,6 +370,149 @@ class CausalSelfAttentionShifted(CausalSelfAttention):
         # Add to residual stream
         return y + x_orig
 
+class CausalSelfAttentionMergeLinear(CausalSelfAttention):
+    """Like CausalSelfAttentionShifted but with learned merge weights instead of averaging."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        # Learned merge weights for combining pairs of tokens
+        # Shape: (max_pairs, 2) where max_pairs = block_size // 2
+        # Each pair position has its own learned weights
+        # Initialized to zeros -> softmax -> (0.5, 0.5) equivalent to averaging
+        max_pairs = config.block_size // 2
+        self.merge_weights = nn.Parameter(torch.zeros(max_pairs, 2))
+        
+    def forward(self, x):
+        B, T, C = x.size()
+        
+        # Store original input for residual connection
+        x_orig = x
+        
+        # calculate query, key, values for all heads in batch
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        # Reshape to (B, T, n_head, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head)
+        q = q.view(B, T, self.n_head, C // self.n_head)
+        v = v.view(B, T, self.n_head, C // self.n_head)
+        
+        # Merge pairs: (0,1), (2,3), (4,5), etc.
+        # Number of pairs we can form
+        num_pairs = T // 2
+        if num_pairs == 0:
+            # Not enough tokens to merge pairs, fall back to regular attention
+            if T == 1:
+                q_t = q[:, 0:1].transpose(1, 2)  # (B, nh, 1, hs)
+                k_t = k[:, 0:1].transpose(1, 2)
+                v_t = v[:, 0:1].transpose(1, 2)
+                
+                if self.flash:
+                    y = torch.nn.functional.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+                else:
+                    att = (q_t @ k_t.transpose(-2, -1)) * (1.0 / math.sqrt(k_t.size(-1)))
+                    att = att.masked_fill(self.bias[:,:,:1,:1] == 0, float('-inf'))
+                    att = F.softmax(att, dim=-1)
+                    att = self.attn_dropout(att)
+                    y = att @ v_t
+                y = y.transpose(1, 2).contiguous().view(B, T, C)
+                y = self.resid_dropout(self.c_proj(y))
+                return y + x_orig
+            else:
+                return x_orig
+        
+        # Get per-position normalized weights via softmax (ensures each pair's weights sum to 1)
+        # Shape: (num_pairs, 2)
+        weights = F.softmax(self.merge_weights[:num_pairs], dim=1)
+        
+        # Extract pairs: tokens at indices (0,1), (2,3), (4,5), etc.
+        pair_start_idx = 0
+        pair_end_idx = pair_start_idx + num_pairs * 2
+        
+        # Reshape to (B, num_pairs, 2, nh, hs) for weighted merge
+        k_pairs = k[:, pair_start_idx:pair_end_idx].view(B, num_pairs, 2, self.n_head, C // self.n_head)
+        q_pairs = q[:, pair_start_idx:pair_end_idx].view(B, num_pairs, 2, self.n_head, C // self.n_head)
+        v_pairs = v[:, pair_start_idx:pair_end_idx].view(B, num_pairs, 2, self.n_head, C // self.n_head)
+        
+        # Apply learned per-position weights: weights shape (num_pairs, 2) -> (1, num_pairs, 2, 1, 1)
+        weights_expanded = weights.view(1, num_pairs, 2, 1, 1)
+        k_merged = (k_pairs * weights_expanded).sum(dim=2)  # (B, num_pairs, nh, hs)
+        q_merged = (q_pairs * weights_expanded).sum(dim=2)
+        v_merged = (v_pairs * weights_expanded).sum(dim=2)
+        
+        # Transpose for attention: (B, nh, num_pairs, hs)
+        k_merged_t = k_merged.transpose(1, 2)
+        q_merged_t = q_merged.transpose(1, 2)
+        v_merged_t = v_merged.transpose(1, 2)
+        
+        # Do attention at 1/2 length (on merged tokens)
+        if self.flash:
+            y_merged = torch.nn.functional.scaled_dot_product_attention(q_merged_t, k_merged_t, v_merged_t, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            att_merged = (q_merged_t @ k_merged_t.transpose(-2, -1)) * (1.0 / math.sqrt(k_merged_t.size(-1)))
+            att_merged = att_merged.masked_fill(self.bias[:,:,:num_pairs,:num_pairs] == 0, float('-inf'))
+            att_merged = F.softmax(att_merged, dim=-1)
+            att_merged = self.attn_dropout(att_merged)
+            y_merged = att_merged @ v_merged_t
+        
+        # Transpose back: (B, num_pairs, nh, hs)
+        y_merged = y_merged.transpose(1, 2)
+        
+        # Shift forward by 1 token position: merged pair (0,1) output -> positions (1,2), merged pair (2,3) -> (3,4), etc.
+        # Expand back 1->2 vectors: each merged token becomes 2 tokens
+        y_expanded = y_merged.unsqueeze(2).expand(B, num_pairs, 2, self.n_head, C // self.n_head)  # (B, num_pairs, 2, nh, hs)
+        y_expanded = y_expanded.contiguous().view(B, num_pairs * 2, self.n_head, C // self.n_head)  # (B, num_pairs*2, nh, hs)
+        
+        # Create output tensor and place expanded outputs at shifted positions (1,2), (3,4), (5,6), ...
+        y = torch.zeros(B, T, self.n_head, C // self.n_head, device=x.device, dtype=y_merged.dtype)
+        
+        # Handle token 0 separately (no merged pair updates it)
+        if T > 0:
+            q0 = q[:, 0:1].transpose(1, 2)  # (B, nh, 1, hs)
+            k0 = k[:, 0:1].transpose(1, 2)
+            v0 = v[:, 0:1].transpose(1, 2)
+            
+            if self.flash:
+                y0 = torch.nn.functional.scaled_dot_product_attention(q0, k0, v0, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            else:
+                att0 = (q0 @ k0.transpose(-2, -1)) * (1.0 / math.sqrt(k0.size(-1)))
+                att0 = att0.masked_fill(self.bias[:,:,:1,:1] == 0, float('-inf'))
+                att0 = F.softmax(att0, dim=-1)
+                att0 = self.attn_dropout(att0)
+                y0 = att0 @ v0
+            y[:, 0] = y0.transpose(1, 2).squeeze(1)
+        
+        # Place expanded outputs at shifted positions: merged pair (0,1) -> positions (1,2), merged pair (2,3) -> (3,4), etc.
+        output_start_idx = 1  # Start at position 1 (merged pair (0,1) updates positions 1,2)
+        output_end_idx = min(output_start_idx + num_pairs * 2, T)
+        if output_start_idx < T:
+            y[:, output_start_idx:output_end_idx] = y_expanded[:, :(output_end_idx - output_start_idx)]
+        
+        # Handle any remaining tokens that weren't part of pairs (e.g., if T is odd and last token wasn't paired)
+        if output_end_idx < T:
+            # Do regular attention on remaining tokens
+            q_remaining = q[:, output_end_idx:].transpose(1, 2)
+            k_remaining = k[:, output_end_idx:].transpose(1, 2)
+            v_remaining = v[:, output_end_idx:].transpose(1, 2)
+            
+            if self.flash:
+                y_remaining = torch.nn.functional.scaled_dot_product_attention(q_remaining, k_remaining, v_remaining, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            else:
+                T_remaining = T - output_end_idx
+                att_remaining = (q_remaining @ k_remaining.transpose(-2, -1)) * (1.0 / math.sqrt(k_remaining.size(-1)))
+                att_remaining = att_remaining.masked_fill(self.bias[:,:,:T_remaining,:T_remaining] == 0, float('-inf'))
+                att_remaining = F.softmax(att_remaining, dim=-1)
+                att_remaining = self.attn_dropout(att_remaining)
+                y_remaining = att_remaining @ v_remaining
+            y[:, output_end_idx:] = y_remaining.transpose(1, 2)
+        
+        # Re-assemble all head outputs side by side
+        y = y.contiguous().view(B, T, C)
+        
+        # Output projection
+        y = self.resid_dropout(self.c_proj(y))
+        
+        # Add to residual stream
+        return y + x_orig
+
 class CausalSelfAttentionMergedHierarchy(CausalSelfAttention):
     """
     Hierarchical attention with:
@@ -388,9 +531,9 @@ class CausalSelfAttentionMergedHierarchy(CausalSelfAttention):
 
     def __init__(self, config):
         super().__init__(config)
-        self.kappa = getattr(config, "kappa", 3)
-        self.alpha = float(getattr(config, "alpha", 2.0))
-        self.local_window = getattr(config, "local_window", 128)
+        self.kappa = getattr(config, "kappa", 4)
+        self.alpha = float(getattr(config, "alpha", 3.0))
+        self.local_window = getattr(config, "local_window", 32)
 
         print(f"Using Hierarchical Merged Attention: kappa={self.kappa}, alpha={self.alpha}, local_window={self.local_window}")
 
@@ -681,6 +824,7 @@ class Block(nn.Module):
             'normal': CausalSelfAttention,
             'merge2': CausalSelfAttentionMerged,
             'merge_shift': CausalSelfAttentionShifted,
+            'merge_linear': CausalSelfAttentionMergeLinear,
             'segtree': CausalSelfAttentionMergedHierarchy,
         }
         self.attn = attn_classes[config.attn](config)
@@ -703,7 +847,7 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     attn: str = 'normal'
 
-    local_window: int = 128   # number of most recent tokens kept at full resolution
+    local_window: int = 32    # number of most recent tokens kept at full resolution
     alpha: float = 2.0        # base for log distance -> level mapping
     kappa: int = 3            # maximum hierarchy level
     
